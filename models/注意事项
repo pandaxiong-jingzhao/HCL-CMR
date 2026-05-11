@@ -1,0 +1,205 @@
+# 主循环代码示例（参考main.py或active_learning.py）
+from models.vmf_uncertainty_model import VMFUncertaintyModel
+from query_strategies import get_strategy
+
+# 1. 初始化模型（替换原有CDALModel）
+model = VMFUncertaintyModel(
+    net=base_model,  # 基础模型（如DALGNN）
+    net_args=net_args,
+    handler=handler,
+    args=args,
+    writer=writer,
+    device=device
+)
+
+# 2. 初始化筛选策略（若需复用原有策略框架，可将不确定性计算集成到策略中）
+strategy = get_strategy(args.query_strategy)(
+    X=train_data, Y=train_labels,
+    idxs_lb=initial_labeled_indices,
+    model=model,  # 传入你的模型用于计算不确定性
+    args=args, device=device
+)
+
+# 3. 主动学习循环
+for round in range(args.n_round):
+    # 3.1 筛选样本（调用你的模型计算不确定性）
+    selected_indices = model.select_samples(
+        img_pool=unlabeled_img_feats,
+        txt_pool=unlabeled_txt_feats,
+        n=args.query_size
+    )
+
+    # 3.2 标记样本
+    strategy.idxs_lb[selected_indices] = True
+
+    # 3.3 训练模型（使用新增标记样本更新模型）
+    for epoch in range(args.epochs):
+        img_batch, txt_batch, labels_batch = get_labeled_batch(strategy.idxs_lb)
+        loss, metrics = model.train_step(
+            img_batch, txt_batch, labels_batch,
+            is_labeled=True  # 有标注数据，启用类别级不确定性计算
+        )
+2. 主动学习筛选与训练阶段的拆分使用
+你的模块虽集成了多功能，但实际运行时需严格区分筛选（无标注数据） 和训练（有标注数据） 两个阶段，核心逻辑如下：
+2.1 主动学习筛选阶段（无标注数据）
+
+    目标：从无标注池中选出最有价值的样本（高不确定性 + 低模态偏见）。
+    调用接口：select_samples方法，内部逻辑：
+        输入无标注的 VGG 图像特征和 BoW 文本特征。
+        调用_sample_level_uncertainty计算样本级不确定性（无需标签）。
+        通过_modal_bias_calibration修正不确定性，惩罚高偏见样本。
+        选择校准后不确定性最高的n个样本。
+# 筛选阶段代码示例（对应query_strategies逻辑）
+def query(self, n):
+    # 获取无标注池特征
+    unlabeled_idxs = np.where(~self.idxs_lb)[0]
+    img_pool = [self.X[i][0] for i in unlabeled_idxs]  # VGG特征
+    txt_pool = [self.X[i][1] for i in unlabeled_idxs]  # BoW特征
+
+    # 调用你的模型筛选样本
+    selected_local_idxs = self.model.select_samples(
+        img_pool=img_pool,
+        txt_pool=txt_pool,
+        n=n,
+        is_labeled=False  # 无标注，使用样本级不确定性
+    )
+
+    # 映射回全局索引
+    return unlabeled_idxs[selected_local_idxs]
+2.2 训练阶段（有标注数据）
+
+    目标：更新模型参数，优化不确定性计算和模态偏见校准能力。
+    调用接口：train_step方法，内部逻辑：
+        输入有标注的特征和标签。
+        调用_class_level_uncertainty计算类别级不确定性（利用标签优化）。
+        计算三元组损失（难例不确定性 > 易例）和偏见校准损失。
+        反向传播更新模型（包括 κ 预测器、自注意力层等参数）。
+# 训练阶段代码示例（对应Training基类逻辑）
+def train_epoch(self, loader):
+    self.model.train()
+    total_loss = 0.0
+    for img_feats, txt_feats, labels in loader:
+        loss, metrics = self.model.train_step(
+            img_feats, txt_feats, labels,
+            is_labeled=True  # 有标注，启用类别级不确定性
+        )
+        total_loss += loss.item()
+    return total_loss / len(loader)
+3.2 创新模块的替代方案
+注册筛选策略：在query_strategies/__init__.py中添加你的策略：
+from .vmf_sampling import VMFSampling  # 封装select_samples的策略类
+STRATEGIES = {
+    # ...原有策略
+    "VMFSampling": VMFSampling
+}
+实现 VMFSampling 策略类（放在query_strategies/vmf_sampling.py）
+from .base_sampler import BaseSampler
+class VMFSampling(BaseSampler):
+    def query(self, n):
+        # 直接调用你的模型的select_samples方法
+        return self.model.select_samples(
+            img_pool=[self.X[i][0] for i in np.where(~self.idxs_lb)[0]],
+            txt_pool=[self.X[i][1] for i in np.where(~self.idxs_lb)[0]],
+            n=n
+        )
+配置文件切换：在config.py中指定策略和模型：
+args.query_strategy = "VMFSampling"
+args.model = "VMFUncertaintyModel"
+4. 完整流程与关键注意事项
+4.1 端到端流程总结
+    初始化：创建VMFUncertaintyModel实例，加载 VGG 和 BoW 特征提取器。
+    第一轮筛选：用初始标记样本训练模型后，调用select_samples从无标注池选样。
+    训练更新：用新增标记样本调用train_step（is_labeled=True），优化不确定性模型。
+    循环迭代：重复筛选 - 训练过程，每次筛选使用最新模型计算不确定性。
+4.2 关键注意事项
+    特征适配：确保输入select_samples和train_step的是 VGG（图像）和 BoW（文本）原始特征（非归一化），与代码中_preprocess_features的处理逻辑匹配。
+    设备一致性：所有特征和模型参数需转移到同一设备（device），避免运行时错误。
+    参数调优：lambda_bias（偏见校准权重）、c/a/b/d（不确定性尺度参数）需根据数据集调整，建议初期用网格搜索确定范围。
+    性能对比：若需与 CDAL 对比，保持query_size、训练轮次等超参数一致，仅替换策略和模型。
+
+特征类型	内在几何	合适的分布	原因
+CLIP / ViT / ALIGN	单位球面 Sd−1	✅ vMF	模型训练时就强制 L2 归一化，方向即语义，模长无信息
+VGG / ResNet (原始)	欧氏空间 Rd	✅ 高斯	激活值大小反映语义强度（如“狗”的响应强弱），模长有信息
+VGG + 强制 L2 归一化	人为投影到球面	❌ 两者都不理想	你丢弃了原本有用的模长信息，但数据又不是为球面设计的
+
+弥补理论短板	在论文中补充 vMF 的 Fisher 信息分析
+连接不确定性与信息增益	说明低 κ ↔ 高不确定性 ↔ 高 EIG
+保持方法简洁性	无需改变代码，只需理论解释
+对标 ASCMR	ASCMR 用高斯 FIM，你用 vMF FIM —— 对称且更适配
+
+注意事项（有疑问的地方）：
+五、CLIP4CMR 在代码中的存在性验证
+    核心结论：代码中没有直接出现model=clip4cmr的显式参数，也没有单独的CLIP4CMR.py文件，但存在适配 CLIP 特征的逻辑，符合论文中 “CLIP 作为预训练骨干” 的描述。
+    具体依据：
+        适配 CLIP 特征的核心代码：itr_models/model.py的ImgNN和TextNN类。CLIP 的图像编码器（如 ViT-B/32）输出 512 维特征，文本编码器也输出 512 维特征，而ImgNN的输入维度可设置为 512（通过img_input_dim=512），TextNN输入维度设置为 512（text_input_dim=512），无需修改网络结构即可接收 CLIP 特征。
+        论文中 “CLIP4CMR” 是 “用 CLIP 作为跨模态骨干的检索模型”，代码中通过以下方式实现：
+            提前用 CLIP 提取图像和文本的 512 维特征，保存为.mat文件（如train_img.mat、train_txt.mat）。
+            dataset.py的CustomDataSet加载这些预提取的 CLIP 特征。
+            itr_models/model.py的DALGNN调用ImgNN和TextNN，直接以 CLIP 特征为输入（无需训练特征编码器），仅微调分类头和 GCN 层，实现检索。
+    为何找不到model=clip4cmr：代码中通过--data_name或数据加载逻辑间接适配（如加载 CLIP 特征文件时，骨干网络自动适配输入维度），而非显式的参数名。
+
+六、ImgNN/TextNN适配 CLIP 特征的正确理解
+你的理解基本正确，更精准的解释是：
+
+    预处理步骤：先用预训练 CLIP 模型提取图像和文本的特征（固定为 512 维，CLIP 的默认输出维度），并保存为特征文件（如train_img.mat包含所有训练图像的 512 维 CLIP 特征）。
+    适配逻辑：
+        ImgNN的input_dim设置为 512（代码中通过img_input_dim=512传入），接收 CLIP 图像特征，通过 1 层全连接层输出minus_one_dim（如 1024 维），该输出作为跨模态公共空间特征的一部分。
+        TextNN同理，input_dim=512接收 CLIP 文本特征，输出相同维度的公共空间特征。
+    关键：“无需额外训练特征编码器” 指不需要训练 CLIP 模型本身（CLIP 是预训练好的，固定特征输出），ImgNN/TextNN仅做 “维度转换 + 简单特征映射”，核心训练集中在分类头和 GCN/GAT 层（用于跨模态对齐）。
+论文中 TABLE VI 与 CLIP4CMR 的对比，代码中并未实现独立的 “CLIP4CMR 模型”，而是通过 “CLIP 预训练特征 + 现有跨模态检索骨干（DALGNN）” 的组合复现了 CLIP4CMR 的核心逻辑，实验结果本质是 “CLIP 特征作为输入” 的 DALGNN 模型性能，与 “原生 DALGNN（用 VGG/ResNet 提取图像特征）” 形成对比。
+关键背景补充
+首先明确 CLIP4CMR 的核心定义（来自论文参考文献 [5]）：CLIP4CMR 是 “基于预训练 CLIP 模型的监督跨模态检索方法”，其核心逻辑是：
+
+    用 CLIP 的图像编码器（如 ViT-B/32）提取图像的 512 维特征；
+    用 CLIP 的文本编码器提取文本的 512 维特征；
+    将两种模态的 CLIP 特征输入到简单的跨模态对齐模块（如 MLP、GCN），通过监督信号（类别标签）优化检索性能。
+
+而论文中的 DALGNN（itr_models/model.py）本身就是 “特征输入 + GCN/GAT 对齐” 的跨模态检索骨干，因此代码中直接复用 DALGNN，仅替换 “输入特征来源”（从 VGG/ResNet 提取改为 CLIP 预提取），即可复现 CLIP4CMR 的实验对比。
+
+# itr_models/model.py 中适配CLIP特征的编码器
+class ImgNN(nn.Module):
+    """Network to learn image representations（适配CLIP 512维特征）"""
+    def __init__(self, input_dim=4096, output_dim=1024):
+        super(ImgNN, self).__init__()
+        self.denseL1 = nn.Linear(input_dim, output_dim)  # 输入维度设为512（CLIP特征维度）
+    def forward(self, x):
+        out = F.relu(self.denseL1(x))
+        return out
+
+class TextNN(nn.Module):
+    """Network to learn text representations（适配CLIP 512维特征）"""
+    def __init__(self, input_dim=1024, output_dim=1024):
+        super(TextNN, self).__init__()
+        self.denseL1 = nn.Linear(input_dim, output_dim)  # 输入维度设为512
+    def forward(self, x):
+        out = F.relu(self.denseL1(x))
+        return out
+
+关于 DALGNN 与 CLIP 特征的适配性，需要结合代码细节和模型设计目标进一步澄清，避免歧义：
+一、“适配” 与 “设计初衷匹配” 的区别
+
+    技术上的可行性（能否运行）：
+
+从代码实现来看，DALGNN 的ImgNN和TextNN是简单的全连接层（如ImgNN(img_input_dim, minus_one_dim)），其输入维度img_input_dim和text_input_dim可通过参数调整（例如设置为 512）。因此，CLIP 的 512 维特征可以作为输入传入模型，代码层面能够运行（这是 “技术适配” 的含义）。
+设计逻辑的匹配性（是否高效）：
+
+    DALGNN 的核心设计目标是弥补低层次特征（如 VGG/BoW）的模态鸿沟，通过复杂的对齐机制（GCN、GAN、对比损失）实现跨模态关联。而 CLIP 特征已通过大规模预训练完成跨模态语义对齐，自带统一语义空间。此时，DALGNN 的冗余对齐操作（如强制特征映射、GAN 对抗）可能破坏 CLIP 的原生语义一致性，导致性能提升有限甚至下降（这是 “设计不适配” 的含义）。
+    简言之：CLIP 特征可以输入 DALGNN 并运行，但二者的设计逻辑存在冲突，可能无法充分发挥 CLIP 的优势。
+
+二、代码中 CLIP 特征的使用方式与 CLIP4CMR 的关联性
+
+    代码中 CLIP 特征的角色：
+
+    代码中并未实现独立的 “CLIP4CMR 模型”，但支持将 CLIP 特征作为输入（通过调整img_input_dim和text_input_dim为 512）。此时，DALGNN 的ImgNN和TextNN仅作为 “维度转换层”（如将 512 维映射到 1024 维），核心的 GCN 层则利用 CLIP 特征已有的语义关联进行优化。这种方式本质是 “用 CLIP 特征替代原有低层次特征，复用 DALGNN 的跨模态对齐模块”。
+    与 CLIP4CMR 的异同：
+        相同点：均以 CLIP 预训练特征为输入，通过轻量级模块（如 GCN/MLP）微调跨模态对齐，符合 CLIP4CMR“利用 CLIP 骨干 + 简单对齐模块” 的核心逻辑。
+        不同点：CLIP4CMR 的对齐模块更轻量化（通常仅 MLP），而 DALGNN 保留了复杂的 GCN 和 GAN，可能引入冗余计算。因此，代码中的实现是 “类 CLIP4CMR 的变体”，而非严格复现，但核心思路一致。
+
+三、总结：适配性的准确理解
+
+    之前的回答中，“可以适配 CLIP 特征” 指技术上能够输入并运行（通过调整维度参数），这一结论正确。
+    “适配性较差” 指设计逻辑不匹配（DALGNN 的冗余操作可能削弱 CLIP 优势），这一结论也正确。二者并不矛盾，只是从不同角度描述适配性。
+
+若要在代码中高效使用 CLIP 特征，建议简化 DALGNN 的对齐模块（如移除 GAN、简化 GCN），仅保留必要的特征映射和分类头，以更贴近 CLIP4CMR 的设计理念，充分利用 CLIP 的预训练语义优势。
+
+DALGNN的info方法与_train_itr中的损失计算目标相似但实现独立，前者未被调用。这种设计很可能是为了适配主动学习框架的灵活性需求 —— 将模型主干（特征提取）与训练策略（损失计算）解耦，便于根据任务调整损失组件，而无需修改模型结构。

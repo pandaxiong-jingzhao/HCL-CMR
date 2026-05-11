@@ -1,0 +1,19 @@
+{
+  "learning_rate": 0.00021669035102391156,
+  "kappa_min": 2.0,
+  "kappa_max": 64.0,
+  "c_intra": 0.12,
+  "lambda_density": 0.03,
+  "alpha_sample": 0.4,
+  "bias_filter_ratio": 0.12,
+  "w_pan": 1.0,
+  "w_dualsoftmax": 1.0,
+  "grad_clip": 0.5,
+  "kappa_soft_tau": 0.18,
+  "density_warmup_rounds": 0,
+  "train_weight_scale": 0.12,
+  "w_lifted": 0.25,
+  "w_triplet": 0.0,
+  "w_contrastive": 0.0,
+  "focal_gamma": 0.5
+}
